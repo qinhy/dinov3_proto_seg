@@ -49,12 +49,53 @@ def ensure_dir(p):
 def pil_open_rgb(p):
     return Image.open(p).convert("RGB")
 
-def rgb_to_mask_from_white(img_rgb,thre=245):
+def rgb_to_mask_from_white(img_rgb, thre=245):
+    """
+    Improved white-background detection with morphological post-processing
+    Returns foreground mask (255=object, 0=background)
+    """
     a = np.array(img_rgb)
-    m = (a[:,:,0] >= thre)
-    m = np.logical_and(m,(a[:,:,1] >= thre))
-    m = np.logical_and(m,(a[:,:,2] >= thre))
-    return (255-m*255).astype(np.uint8)
+    H, W = a.shape[:2]
+
+    # 1) Multi-threshold strategy: detect pixels that are "white-ish"
+    # Lower threshold to catch near-white pixels (compression artifacts, shadows)
+    lower_thre = max(200, thre - 30)
+
+    # RGB-based white detection
+    rgb_white = np.all(a >= lower_thre, axis=2)
+
+    # HSV-based: high value, low saturation = white
+    hsv = cv2.cvtColor(a, cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+    hsv_white = (v >= 200) & (s <= 50)
+
+    # Combine both criteria
+    background = rgb_white | hsv_white
+    foreground = ~background
+
+    # 2) Morphological operations to clean up noise
+    kernel_small = np.ones((3, 3), np.uint8)
+    kernel_large = np.ones((7, 7), np.uint8)
+
+    # Remove small holes in foreground
+    fg_clean = cv2.morphologyEx(foreground.astype(np.uint8), cv2.MORPH_CLOSE, kernel_small)
+
+    # Remove small foreground specks
+    fg_clean = cv2.morphologyEx(fg_clean, cv2.MORPH_OPEN, kernel_small)
+
+    # 3) Keep only the largest connected component (main object)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(fg_clean, connectivity=8)
+
+    if num_labels > 1:
+        # Find largest component (excluding background label 0)
+        sizes = stats[1:, cv2.CC_STAT_AREA]
+        largest_label = np.argmax(sizes) + 1
+        fg_clean = (labels == largest_label).astype(np.uint8)
+
+    # 4) Dilate slightly to include boundary pixels
+    fg_final = cv2.dilate(fg_clean, kernel_small, iterations=1)
+
+    return (fg_final * 255).astype(np.uint8)
 
 @torch.inference_mode()
 def get_patch_tokens(model, processor, pil_img, device):
@@ -131,7 +172,7 @@ def make_prototypes_from_pngs(model, processor, png_paths, device):
     f_list, b_list = [], []
     for p in png_paths:
         img = pil_open_rgb(p)
-        mask = rgb_to_mask_from_white(img,200)    # [H, W] {0,1}
+        mask = rgb_to_mask_from_white(img, thre=220)    # [H, W] {0,255}
         tokens, grid, img_hw = get_patch_tokens(model, processor, img, device)
         m_grid = resize_mask_to_grid(mask, grid) > 0
         T = tokens.view(-1, tokens.shape[-1])          # [Gh*Gw, C]

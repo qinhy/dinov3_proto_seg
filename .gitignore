@@ -180,3 +180,4 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 /dinov3_open_apples
+.claude/settings.local.json
